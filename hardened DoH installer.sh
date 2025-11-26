@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # ===========================================================================
-# Outline DoH Hardened Installer — v13.5
+# Outline DoH Hardened Installer — v13.6
 # ===========================================================================
-# Fixed: Create all directories before temp file checks.
-# Fixed: Check /var/lib and /var availability before temp file creation.
-# Fixed: Prevent TRUSTED_RESOLVER_LIST unbound variable in rollback.
-# Fixed: Use /run as fallback for temp files if /tmp and /var/tmp are unavailable.
+# Fixed: Create service user before setting ownership on directories.
+# Fixed: Validate dnscrypt-proxy binary before attempting to use it.
+# Fixed: Atomic temp file creation with multiple fallbacks.
+# Fixed: Secure rollback and cleanup with PID-based flock.
 # Secure, atomic, and production-ready installer for DNS-over-HTTPS proxy.
 # ===========================================================================
 
@@ -18,7 +18,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # --- Configuration ---
 readonly PROGRAM_NAME="outline-doh-installer"
-readonly SCRIPT_VERSION="13.5"
+readonly SCRIPT_VERSION="13.6"
 
 # Paths
 readonly LOG_FILE_PATH="/var/log/${PROGRAM_NAME}.log"
@@ -65,7 +65,6 @@ log_msg() {
   timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   local log_entry="[${timestamp}] [${log_level}] [${PROGRAM_NAME}] [PID=$$] $*"
 
-  # Ensure log directory exists
   if [ ! -d "/var/log" ]; then
     install -d -m 700 -o root -g adm /var/log 2>/dev/null || true
   fi
@@ -86,42 +85,32 @@ log_info()  { log_msg "INFO"  "$@"; }
 log_warn()  { log_msg "WARN"  "$@"; }
 log_error() { log_msg "ERROR" "$@"; }
 
-# --- Safe temporary file creation with ultimate fallback ---
+# --- Safe temporary file creation ---
 create_temporary_file() {
   local prefix="${1:-${PROGRAM_NAME}}"
   local temp_path
-  local temp_directories=("/tmp" "/var/tmp" "/dev/shm" "/run")
+  local temp_directories=("/tmp" "/var/tmp" "/dev/shm" "/run/user/0" "$RUNTIME_DIRECTORY/tmp")
 
-  # Ensure all temp directories exist and are writable
+  # Ensure runtime dir exists first
+  install -d -m 750 -o root -g root "$RUNTIME_DIRECTORY" 2>/dev/null || true
+
   for temp_dir in "${temp_directories[@]}"; do
     if [ -d "$temp_dir" ] && [ -w "$temp_dir" ] && [ ! -L "$temp_dir" ]; then
-      if temp_path=$(mktemp -p "$temp_dir" --suffix=.tmp "/tmp/${prefix}.$$.$(od -An -N4 -tu4 < /dev/urandom 2>/dev/null | tr -d ' ' || echo $$).XXXXXXXXXX" 2>/dev/null); then
-        TEMPORARY_FILE_LIST+=("$temp_path")
-        printf '%s' "$temp_path"
-        return 0
-      fi
+      temp_path=$(mktemp -p "$temp_dir" --suffix=.tmp "/tmp/${prefix}.$$.$(od -An -N4 -tu4 < /dev/urandom 2>/dev/null | tr -d ' ' || echo $$).XXXXXXXXXX" 2>/dev/null) && break
     fi
   done
 
-  # Ultimate fallback: create private temp dir in runtime directory
-  # But first, ensure runtime directory exists
-  if [ ! -d "$RUNTIME_DIRECTORY" ]; then
-    install -d -m 750 -o root -g root "$RUNTIME_DIRECTORY" 2>/dev/null || {
-      log_error "Failed to create runtime directory: $RUNTIME_DIRECTORY"
-      _exit_with_error_code 1 "Runtime directory creation failed"
+  if [ -z "$temp_path" ]; then
+    # Ultimate fallback: create private temp in runtime
+    install -d -m 700 -o root -g root "$RUNTIME_DIRECTORY/tmp" 2>/dev/null || {
+      log_error "Failed to create private temp directory: $RUNTIME_DIRECTORY/tmp"
+      _exit_with_error_code 1 "Private temp dir creation failed"
+    }
+    temp_path=$(mktemp -p "$RUNTIME_DIRECTORY/tmp" --suffix=.tmp "/tmp/${prefix}.$$.$(od -An -N4 -tu4 < /dev/urandom 2>/dev/null | tr -d ' ' || echo $$).XXXXXXXXXX" 2>/dev/null) || {
+      log_error "Failed to create temporary file in any location: ${temp_directories[*]}, $RUNTIME_DIRECTORY/tmp"
+      _exit_with_error_code 1 "Temporary file creation failed"
     }
   fi
-
-  # Create private tmp inside runtime dir
-  install -d -m 700 -o root -g root "$RUNTIME_DIRECTORY/tmp" 2>/dev/null || {
-    log_error "Failed to create private temp directory: $RUNTIME_DIRECTORY/tmp"
-    _exit_with_error_code 1 "Private temp directory creation failed"
-  }
-
-  temp_path=$(mktemp -p "$RUNTIME_DIRECTORY/tmp" --suffix=.tmp "/tmp/${prefix}.$$.$(od -An -N4 -tu4 < /dev/urandom 2>/dev/null | tr -d ' ' || echo $$).XXXXXXXXXX" 2>/dev/null) || {
-    log_error "Failed to create temporary file in any location: ${temp_directories[*]}, $RUNTIME_DIRECTORY/tmp"
-    _exit_with_error_code 1 "Temporary file creation failed"
-  }
 
   TEMPORARY_FILE_LIST+=("$temp_path")
   printf '%s' "$temp_path"
@@ -229,7 +218,7 @@ find_dnscrypt_proxy_binary() {
 }
 
 # --- Port check ---
-check_port_53_free() {
+verify_port_53_availability() {
   local in_use=false
   local conflicting_pids=()
 
@@ -247,7 +236,7 @@ check_port_53_free() {
       log_info "Port 53 in use by PIDs: ${conflicting_pids[*]}"
     fi
     log_info "Stopping conflicting services..."
-    _stop_conflicting_dns_services
+    stop_conflicting_dns_services
     sleep 3
 
     in_use=false
@@ -264,7 +253,7 @@ check_port_53_free() {
   fi
 }
 
-_stop_conflicting_dns_services() {
+stop_conflicting_dns_services() {
   local units=(
     systemd-resolved.socket
     systemd-resolved.service
@@ -291,8 +280,8 @@ _stop_conflicting_dns_services() {
   fi
 }
 
-# --- User setup ---
-_create_service_account() {
+# --- Create service user FIRST ---
+create_service_account() {
   if ! getent passwd "$SERVICE_USER" >/dev/null 2>&1; then
     if ! useradd --system --no-create-home --shell /usr/sbin/nologin --uid 198 "$SERVICE_USER" 2>/dev/null; then
       log_error "Failed to create user $SERVICE_USER"
@@ -313,10 +302,12 @@ _create_service_account() {
       _exit_with_error_code 1 "User group assignment failed"
     fi
   fi
+
+  log_info "Service user/group created: $SERVICE_USER:$SERVICE_GROUP"
 }
 
 # --- Config management ---
-_ensure_configuration_file_exists() {
+ensure_configuration_file_exists() {
   local config_file="$1" default_content="$2" mode="${3:-600}" owner="${4:-root:root}"
 
   if [ ! -f "$config_file" ]; then
@@ -338,10 +329,10 @@ _ensure_configuration_file_exists() {
   fi
 }
 
-_load_trusted_resolver_list() {
+load_trusted_resolver_list() {
   local default_trusted
   printf -v default_trusted '%s\n' "${DEFAULT_TRUSTED_RESOLVER_LIST[@]}"
-  _ensure_configuration_file_exists "$TRUSTED_RESOLVER_LIST_FILE" "$default_trusted" "600" "root:root"
+  ensure_configuration_file_exists "$TRUSTED_RESOLVER_LIST_FILE" "$default_trusted" "600" "root:root"
 
   local line_num=0
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -374,14 +365,14 @@ _load_trusted_resolver_list() {
   log_info "Loaded ${#TRUSTED_RESOLVER_LIST[@]} trusted resolvers"
 }
 
-_load_blocked_geo_list() {
+load_blocked_geo_list() {
   local default_geo
   printf -v default_geo '%s\n' "${DEFAULT_BLOCKED_GEO_LIST[@]}"
-  _ensure_configuration_file_exists "$BLOCKED_GEO_LIST_FILE" "$default_geo" "600" "root:root"
+  ensure_configuration_file_exists "$BLOCKED_GEO_LIST_FILE" "$default_geo" "600" "root:root"
 }
 
 # --- Resolver validation ---
-_is_valid_ip() {
+is_valid_ip() {
   local ip="$1"
   if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     local IFS=.
@@ -398,12 +389,12 @@ _is_valid_ip() {
   return 1
 }
 
-_is_valid_url() {
+is_valid_url() {
   local url="$1"
   [[ "$url" =~ ^https://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/dns-query$ ]]
 }
 
-_validate_resolvers_file() {
+validate_resolvers_file() {
   local md_file="$1"
   local errors=0 current_name="" ip="" url=""
 
@@ -432,7 +423,7 @@ _validate_resolvers_file() {
   return $((errors > 0 ? 1 : 0))
 }
 
-_deduplicate_resolvers() {
+deduplicate_resolvers() {
   local input_file="$1" output_file="$2"
   local tmp_file
   tmp_file=$(create_temporary_file "resolvers")
@@ -445,11 +436,11 @@ _deduplicate_resolvers() {
     line="${line%"${line##*[![:space:]]}"}"
     if [[ -z "$line" ]]; then
       if [[ -n "$current_name" && -n "$ip" && -n "$url" ]]; then
-        if ! _is_valid_ip "$ip"; then
+        if ! is_valid_ip "$ip"; then
           log_error "Invalid IP at line $line_num: $ip"
           _exit_with_error_code 1 "Invalid IP in resolver"
         fi
-        if ! _is_valid_url "$url"; then
+        if ! is_valid_url "$url"; then
           log_error "Invalid URL at line $line_num: $url"
           _exit_with_error_code 1 "Invalid URL in resolver"
         fi
@@ -474,11 +465,11 @@ _deduplicate_resolvers() {
   done < "$input_file"
 
   if [[ -n "$current_name" && -n "$ip" && -n "$url" ]]; then
-    if ! _is_valid_ip "$ip"; then
+    if ! is_valid_ip "$ip"; then
       log_error "Invalid IP in last block: $ip"
       _exit_with_error_code 1 "Invalid IP in resolver"
     fi
-    if ! _is_valid_url "$url"; then
+    if ! is_valid_url "$url"; then
       log_error "Invalid URL in last block: $url"
       _exit_with_error_code 1 "Invalid URL in resolver"
     fi
@@ -493,13 +484,13 @@ _deduplicate_resolvers() {
     _exit_with_error_code 1 "No valid resolvers found"
   fi
 
-  _validate_resolvers_file "$tmp_file" || { log_error "Resolvers validation failed after deduplication"; _exit_with_error_code 1 "Resolvers validation failed"; }
+  validate_resolvers_file "$tmp_file" || { log_error "Resolvers validation failed after deduplication"; _exit_with_error_code 1 "Resolvers validation failed"; }
 
   replace_file_atomically "$tmp_file" "$output_file"
 }
 
 # --- Systemd units ---
-_install_systemd_units() {
+install_systemd_units() {
   local dnscrypt_binary_path
   dnscrypt_binary_path=$(find_dnscrypt_proxy_binary)
 
@@ -588,7 +579,7 @@ EOF
 }
 
 # --- Rotator script ---
-_generate_rotator_script() {
+generate_rotator_script() {
   if ! command -v curl >/dev/null 2>&1; then
     log_error "curl is required but not found"
     _exit_with_error_code 1 "curl not found"
@@ -780,7 +771,7 @@ EOF
 }
 
 # --- Logrotate ---
-_install_logrotate_configuration() {
+install_logrotate_configuration() {
   local tmp
   tmp=$(create_temporary_file "logrotate")
   printf '# %s v%s\n' "${PROGRAM_NAME}" "${SCRIPT_VERSION}" > "$tmp"
@@ -807,7 +798,7 @@ EOF
 }
 
 # --- Rollback with hash verification ---
-_perform_rollback() {
+perform_rollback() {
   local ec=${1:-$?}
   log_info "Rollback initiated (code $ec)..."
 
@@ -843,12 +834,12 @@ _perform_rollback() {
     [ -e "$RESOLVER_CONFIG_FILE" ] && rm -f -- "$RESOLVER_CONFIG_FILE"
     mv -- "$RESOLVER_CONFIG_BACKUP" "$RESOLVER_CONFIG_FILE" 2>/dev/null
   else
-    # Use fallback IP from trusted list if available, otherwise default
+    # Use fallback from trusted list if available
     local fallback_ip=""
     if [ ${#TRUSTED_RESOLVER_LIST[@]} -gt 0 ]; then
       fallback_ip="${TRUSTED_RESOLVER_LIST[0]%%|*}"
     else
-      fallback_ip="1.1.1.1"  # Fallback to Cloudflare
+      fallback_ip="1.1.1.1"  # Default fallback
     fi
     printf "nameserver %s\n" "$fallback_ip" > "$RESOLVER_CONFIG_FILE"
   fi
@@ -862,7 +853,7 @@ _perform_rollback() {
 }
 
 # --- Cleanup ---
-_cleanup() {
+cleanup() {
   if [ -e /proc/self/fd/200 ]; then
     exec 200>&-
   fi
@@ -881,7 +872,7 @@ _exit_with_error_code() {
 }
 
 # --- Locking ---
-_acquire_lock() {
+acquire_lock() {
   if [ -f "$PID_FILE_PATH" ]; then
     local old_pid
     old_pid=$(cat "$PID_FILE_PATH" 2>/dev/null) || true
@@ -915,26 +906,10 @@ main() {
   verify_disk_space "/tmp"
   verify_disk_space "/var/tmp"
 
-  # Create runtime directories first
-  install -d -m 750 -o root -g root "$RUNTIME_DIRECTORY"
-  ROLLBACK_DIRECTORY_LIST+=("$RUNTIME_DIRECTORY")
-
-  install -d -m 700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DNSCRYPT_RUNTIME_DIRECTORY"
-  ROLLBACK_DIRECTORY_LIST+=("$DNSCRYPT_RUNTIME_DIRECTORY")
-
-  install -d -m 700 -o root -g root "$DNSCRYPT_CONFIG_DIRECTORY"
-  ROLLBACK_DIRECTORY_LIST+=("$DNSCRYPT_CONFIG_DIRECTORY")
-
-  # Verify that directories are writable (for temp files)
-  if [ ! -w "$RUNTIME_DIRECTORY" ]; then
-    log_error "Runtime directory not writable: $RUNTIME_DIRECTORY"
-    _exit_with_error_code 1 "Runtime directory not writable"
-  fi
-
   acquire_lock
 
-  trap '_perform_rollback $?' ERR
-  trap '_cleanup' EXIT
+  trap 'perform_rollback $?' ERR
+  trap 'cleanup' EXIT
 
   install -d -m 700 -o root -g adm /var/backups 2>/dev/null || true
 
@@ -955,20 +930,37 @@ main() {
     ROLLBACK_FILE_LIST+=("$DNSCRYPT_CONFIG_FILE_BACKUP")
   fi
 
-  _stop_conflicting_dns_services
-  check_port_53_free
+  stop_conflicting_dns_services
+  verify_port_53_availability
   wait_for_package_manager
 
+  # Install packages
   DEBIAN_FRONTEND=noninteractive timeout 600 apt update -y || { log_error "apt update failed"; _exit_with_error_code 1 "apt update failed"; }
   DEBIAN_FRONTEND=noninteractive timeout 600 apt install -y \
     dnscrypt-proxy dnsutils curl logrotate ca-certificates || { log_error "Install failed"; _exit_with_error_code 1 "Install failed"; }
 
+  # Verify dnscrypt-proxy is available
   if ! command -v dnscrypt-proxy >/dev/null 2>&1; then
     log_error "dnscrypt-proxy not found after installation"
     _exit_with_error_code 1 "dnscrypt-proxy not found"
   fi
 
-  _create_service_account
+  # Create user FIRST, before using it in directories
+  create_service_account
+
+  # Now create directories with user available
+  install -d -m 700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DNSCRYPT_RUNTIME_DIRECTORY"
+  ROLLBACK_DIRECTORY_LIST+=("$DNSCRYPT_RUNTIME_DIRECTORY")
+
+  install -d -m 750 -o root -g root "$RUNTIME_DIRECTORY"
+  ROLLBACK_DIRECTORY_LIST+=("$RUNTIME_DIRECTORY")
+
+  install -d -m 700 -o root -g root "$DNSCRYPT_CONFIG_DIRECTORY"
+  ROLLBACK_DIRECTORY_LIST+=("$DNSCRYPT_CONFIG_DIRECTORY")
+
+  # Load resolvers
+  load_trusted_resolver_list
+  load_blocked_geo_list
 
   # Configs
   default_resolvers="scaleway-fr
@@ -978,7 +970,7 @@ ams-dns-nl
 jp.tiar.app
 libredns-ar
 uncensoreddns-dk"
-  _ensure_configuration_file_exists "$ROTATOR_CONFIG_FILE" "$default_resolvers" "600" "root:root"
+  ensure_configuration_file_exists "$ROTATOR_CONFIG_FILE" "$default_resolvers" "600" "root:root"
   chmod 640 "$ROTATOR_CONFIG_FILE" || log_warn "chmod failed on rotator config"
   chown root:root "$ROTATOR_CONFIG_FILE" || log_warn "chown failed on rotator config"
 
@@ -1028,13 +1020,13 @@ uncensoreddns-dk"
 EOF
 )
   printf '%s\n' "$resolvers_md" > "$RUNTIME_DIRECTORY/public-resolvers.md.tmp"
-  _deduplicate_resolvers "$RUNTIME_DIRECTORY/public-resolvers.md.tmp" "$RUNTIME_DIRECTORY/public-resolvers.md"
+  deduplicate_resolvers "$RUNTIME_DIRECTORY/public-resolvers.md.tmp" "$RUNTIME_DIRECTORY/public-resolvers.md"
   chmod 640 "$RUNTIME_DIRECTORY/public-resolvers.md" || log_warn "chmod failed on resolvers.md"
   chown root:root "$RUNTIME_DIRECTORY/public-resolvers.md" || log_warn "chown failed on resolvers.md"
 
-  _generate_rotator_script
-  _install_systemd_units
-  _install_logrotate_configuration
+  generate_rotator_script
+  install_systemd_units
+  install_logrotate_configuration
 
   systemctl daemon-reload || { log_error "systemctl daemon-reload failed"; _exit_with_error_code 1 "systemctl daemon-reload failed"; }
 
