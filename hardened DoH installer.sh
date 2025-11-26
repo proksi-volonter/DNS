@@ -1,12 +1,11 @@
 #!/bin/bash
 
 # ===========================================================================
-# Outline DoH Hardened Installer — v13.6
+# Outline DoH Hardened Installer — v13.7
 # ===========================================================================
-# Fixed: Create service user before setting ownership on directories.
-# Fixed: Validate dnscrypt-proxy binary before attempting to use it.
-# Fixed: Atomic temp file creation with multiple fallbacks.
-# Fixed: Secure rollback and cleanup with PID-based flock.
+# Fixed: Restore DNS before package installation to prevent apt failures.
+# Fixed: Temporarily restore resolv.conf before apt update/install.
+# Fixed: All previous security and reliability issues.
 # Secure, atomic, and production-ready installer for DNS-over-HTTPS proxy.
 # ===========================================================================
 
@@ -18,7 +17,7 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # --- Configuration ---
 readonly PROGRAM_NAME="outline-doh-installer"
-readonly SCRIPT_VERSION="13.6"
+readonly SCRIPT_VERSION="13.7"
 
 # Paths
 readonly LOG_FILE_PATH="/var/log/${PROGRAM_NAME}.log"
@@ -58,6 +57,9 @@ declare -a TRUSTED_RESOLVER_LIST=()
 declare -a RESOLVED_CONFLICT_LIST=()
 declare -a TEMPORARY_FILE_LIST=()
 
+# Track original resolv.conf content
+declare ORIGINAL_RESOLV_CONTENT=""
+
 # --- Logging ---
 log_msg() {
   local log_level="$1"; shift
@@ -86,12 +88,11 @@ log_warn()  { log_msg "WARN"  "$@"; }
 log_error() { log_msg "ERROR" "$@"; }
 
 # --- Safe temporary file creation ---
-create_temporary_file() {
+create_temp_file() {
   local prefix="${1:-${PROGRAM_NAME}}"
   local temp_path
   local temp_directories=("/tmp" "/var/tmp" "/dev/shm" "/run/user/0" "$RUNTIME_DIRECTORY/tmp")
 
-  # Ensure runtime dir exists first
   install -d -m 750 -o root -g root "$RUNTIME_DIRECTORY" 2>/dev/null || true
 
   for temp_dir in "${temp_directories[@]}"; do
@@ -101,7 +102,6 @@ create_temporary_file() {
   done
 
   if [ -z "$temp_path" ]; then
-    # Ultimate fallback: create private temp in runtime
     install -d -m 700 -o root -g root "$RUNTIME_DIRECTORY/tmp" 2>/dev/null || {
       log_error "Failed to create private temp directory: $RUNTIME_DIRECTORY/tmp"
       _exit_with_error_code 1 "Private temp dir creation failed"
@@ -313,7 +313,7 @@ ensure_configuration_file_exists() {
   if [ ! -f "$config_file" ]; then
     log_info "Creating default config: $config_file"
     local tmp
-    tmp=$(create_temporary_file "config")
+    tmp=$(create_temp_file "config")
     printf '%s\n' "# ${PROGRAM_NAME} v${SCRIPT_VERSION}" > "$tmp"
     printf '%s\n' "$default_content" >> "$tmp"
     replace_file_atomically "$tmp" "$config_file"
@@ -426,7 +426,7 @@ validate_resolvers_file() {
 deduplicate_resolvers() {
   local input_file="$1" output_file="$2"
   local tmp_file
-  tmp_file=$(create_temporary_file "resolvers")
+  tmp_file=$(create_temp_file "resolvers")
 
   local current_name="" ip="" url="" geo=""
   local line_num=0 valid_count=0
@@ -495,7 +495,7 @@ install_systemd_units() {
   dnscrypt_binary_path=$(find_dnscrypt_proxy_binary)
 
   local tmp
-  tmp=$(create_temporary_file "proxy-service")
+  tmp=$(create_temp_file "proxy-service")
   printf '# %s v%s\n' "${PROGRAM_NAME}" "${SCRIPT_VERSION}" > "$tmp"
   cat >> "$tmp" <<EOF
 [Unit]
@@ -533,7 +533,7 @@ WantedBy=multi-user.target
 EOF
   replace_file_atomically "$tmp" "/etc/systemd/system/outline-doh-proxy.service"
 
-  tmp=$(create_temporary_file "rotator-service")
+  tmp=$(create_temp_file "rotator-service")
   printf '# %s v%s\n' "${PROGRAM_NAME}" "${SCRIPT_VERSION}" > "$tmp"
   cat >> "$tmp" <<EOF
 [Unit]
@@ -560,7 +560,7 @@ WantedBy=multi-user.target
 EOF
   replace_file_atomically "$tmp" "/etc/systemd/system/outline-doh-rotator.service"
 
-  tmp=$(create_temporary_file "timer")
+  tmp=$(create_temp_file "timer")
   printf '# %s v%s\n' "${PROGRAM_NAME}" "${SCRIPT_VERSION}" > "$tmp"
   cat >> "$tmp" <<EOF
 [Unit]
@@ -590,7 +590,7 @@ generate_rotator_script() {
   fi
 
   local tmp
-  tmp=$(create_temporary_file "rotator-script")
+  tmp=$(create_temp_file "rotator-script")
   printf '# %s v%s\n' "${PROGRAM_NAME}" "${SCRIPT_VERSION}" > "$tmp"
   cat >> "$tmp" <<'EOF'
 #!/bin/bash
@@ -773,7 +773,7 @@ EOF
 # --- Logrotate ---
 install_logrotate_configuration() {
   local tmp
-  tmp=$(create_temporary_file "logrotate")
+  tmp=$(create_temp_file "logrotate")
   printf '# %s v%s\n' "${PROGRAM_NAME}" "${SCRIPT_VERSION}" > "$tmp"
   cat >> "$tmp" <<EOF
 /var/log/outline-doh-installer.log
@@ -834,12 +834,10 @@ perform_rollback() {
     [ -e "$RESOLVER_CONFIG_FILE" ] && rm -f -- "$RESOLVER_CONFIG_FILE"
     mv -- "$RESOLVER_CONFIG_BACKUP" "$RESOLVER_CONFIG_FILE" 2>/dev/null
   else
-    # Use fallback from trusted list if available
-    local fallback_ip=""
-    if [ ${#TRUSTED_RESOLVER_LIST[@]} -gt 0 ]; then
-      fallback_ip="${TRUSTED_RESOLVER_LIST[0]%%|*}"
-    else
-      fallback_ip="1.1.1.1"  # Default fallback
+    # Use fallback from trusted list if available, otherwise default
+    local fallback_ip="${TRUSTED_RESOLVER_LIST[0]%%|*}"
+    if [[ -z "$fallback_ip" ]]; then
+      fallback_ip="1.1.1.1"
     fi
     printf "nameserver %s\n" "$fallback_ip" > "$RESOLVER_CONFIG_FILE"
   fi
@@ -913,6 +911,7 @@ main() {
 
   install -d -m 700 -o root -g adm /var/backups 2>/dev/null || true
 
+  # Backup resolv.conf BEFORE stopping systemd-resolved
   if [ -f "$RESOLVER_CONFIG_FILE" ] && [ ! -L "$RESOLVER_CONFIG_FILE" ]; then
     safe_copy "$RESOLVER_CONFIG_FILE" "$RESOLVER_CONFIG_BACKUP"
     ROLLBACK_FILE_LIST+=("$RESOLVER_CONFIG_BACKUP")
@@ -922,7 +921,11 @@ main() {
     if [ -f "$target" ]; then
       safe_copy "$target" "$RESOLVER_CONFIG_BACKUP"
       ROLLBACK_FILE_LIST+=("$RESOLVER_CONFIG_BACKUP")
+      # Store original content for later restoration
+      ORIGINAL_RESOLV_CONTENT=$(cat "$target")
     fi
+  else
+    ORIGINAL_RESOLV_CONTENT=$(cat "$RESOLVER_CONFIG_FILE" 2>/dev/null || echo "")
   fi
 
   if [ -f "$DNSCRYPT_CONFIG_FILE_ORIGINAL" ] && [ ! -L "$DNSCRYPT_CONFIG_FILE_ORIGINAL" ]; then
@@ -933,6 +936,13 @@ main() {
   stop_conflicting_dns_services
   verify_port_53_availability
   wait_for_package_manager
+
+  # TEMPORARILY RESTORE DNS FOR PACKAGE INSTALLATION
+  if [ -L "$RESOLVER_CONFIG_FILE" ]; then
+    rm -f -- "$RESOLVER_CONFIG_FILE"
+  fi
+  [ -e "$RESOLVER_CONFIG_FILE" ] && rm -f -- "$RESOLVER_CONFIG_FILE"
+  printf "nameserver 8.8.8.8\nnameserver 1.1.1.1\n" > "$RESOLVER_CONFIG_FILE"
 
   # Install packages
   DEBIAN_FRONTEND=noninteractive timeout 600 apt update -y || { log_error "apt update failed"; _exit_with_error_code 1 "apt update failed"; }
@@ -945,10 +955,17 @@ main() {
     _exit_with_error_code 1 "dnscrypt-proxy not found"
   fi
 
+  # Restore original resolv.conf
+  if [ -n "$ORIGINAL_RESOLV_CONTENT" ]; then
+    printf '%s\n' "$ORIGINAL_RESOLV_CONTENT" > "$RESOLVER_CONFIG_FILE"
+  else
+    printf "nameserver 8.8.8.8\n" > "$RESOLVER_CONFIG_FILE"
+  fi
+
   # Create user FIRST, before using it in directories
   create_service_account
 
-  # Now create directories with user available
+  # Create directories with user available
   install -d -m 700 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DNSCRYPT_RUNTIME_DIRECTORY"
   ROLLBACK_DIRECTORY_LIST+=("$DNSCRYPT_RUNTIME_DIRECTORY")
 
